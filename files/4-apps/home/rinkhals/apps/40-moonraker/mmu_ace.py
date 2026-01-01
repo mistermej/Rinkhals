@@ -11,12 +11,14 @@ import logging
 import os
 import re
 import asyncio
+import aiohttp
 import shutil
 import sys
 import time
 import traceback
 import tempfile
 
+from urllib.parse import urljoin
 from collections import OrderedDict
 from dataclasses import dataclass, asdict
 from enum import Enum
@@ -1313,6 +1315,19 @@ class MmuAcePatcher:
         self.kobra = self.server.load_component(self.server.config, 'kobra')
 
         host = config.get("host", None)
+        # --- Spoolman sync (optional) ---
+        self.enable_spoolman_sync = config.getboolean('enable_spoolman_sync', False)
+        self.enable_spoolman_pull = config.getboolean('enable_spoolman_pull', False)
+        self.spoolman_clear_on_empty = config.getboolean('spoolman_clear_on_empty', True)
+        # Moonraker local endpoint (internal call via HTTP)
+        self._spoolman_moonraker_url = config.get('spoolman_moonraker_url', 'http://127.0.0.1:7125')
+        # Spoolman server URL (for pull)
+        self._spoolman_server_url = config.get('spoolman_server_url', None)
+        # Optional: match only spools assigned to this printer name
+        self._spoolman_printer_name = config.get('spoolman_printer_name', '')
+        self._spoolman_last_gate = None
+        self._spoolman_last_spool_id = object()
+
         self.ace_controller = MmuAceController(self.server, host)
 
         self.reinit()
@@ -2081,6 +2096,167 @@ class MmuAcePatcher:
 
     def get_status(self) -> dict:
         return asdict(self.ace_controller.get_status())
+    def _spoolman_sync_from_gate(self, mmu_status: dict):
+        """Bidirectional Spoolman sync.
+        1) If gate has spool_id (gate_spool_id), push it to Moonraker active spool.
+        2) If missing and enable_spoolman_pull, try to pull matching spool from Spoolman by MMU Gate.
+        Never breaks MMU/UI.
+        """
+        try:
+            if not getattr(self, 'enable_spoolman_sync', False):
+                return
+
+            gate = mmu_status.get('gate', -1)
+            if gate is None:
+                return
+
+            spool_ids = mmu_status.get('gate_spool_id')
+            target_spool = None
+
+            # --- 1) Try MMU-provided spool id ---
+            if isinstance(spool_ids, list) and 0 <= gate < len(spool_ids):
+                sid = spool_ids[gate]
+                if sid not in (None, 0, -1, ''):
+                    try:
+                        target_spool = int(sid)
+                    except Exception:
+                        target_spool = None
+
+            # --- 2) Pull from Spoolman if missing ---
+            if target_spool is None and getattr(self, 'enable_spoolman_pull', False):
+                sp_url = getattr(self, '_spoolman_server_url', None)
+                if sp_url:
+                    sp_url = sp_url.rstrip('/') + '/'
+                    printer_name = (getattr(self, '_spoolman_printer_name', '') or '').strip()
+
+                    async def _find_spool_id_for_gate() -> int | None:
+                        try:
+                            # Spoolman REST API base is /api/v1/ :contentReference[oaicite:1]{index=1}
+                            api = urljoin(sp_url, 'api/v1/spool')
+                            timeout = aiohttp.ClientTimeout(total=3)
+                            async with aiohttp.ClientSession(timeout=timeout) as session:
+                                # fetch a reasonably big list; spool count is usually small
+                                async with session.get(api, params={'limit': 2000}) as resp:
+                                    data = await resp.json()
+                        except Exception:
+                            return None
+
+                        if not isinstance(data, list):
+                            return None
+
+                        def _extract_mmu_gate(spool: dict):
+                            # Different Spoolman versions/plugins store this differently.
+                            # We support multiple shapes to stay robust.
+                            # 1) Direct fields
+                            for k in ('mmu_gate', 'mmuGate', 'mmu_gate_id'):
+                                if k in spool:
+                                    return spool.get(k)
+                            # 2) mmu object
+                            mmu = spool.get('mmu')
+                            if isinstance(mmu, dict):
+                                if 'gate' in mmu:
+                                    return mmu.get('gate')
+                                if 'mmu_gate' in mmu:
+                                    return mmu.get('mmu_gate')
+                            # 3) extra fields as list
+                            ef = spool.get('extra_fields')
+                            if isinstance(ef, list):
+                                for item in ef:
+                                    if not isinstance(item, dict):
+                                        continue
+                                    fld = item.get('field')
+                                    name = ''
+                                    if isinstance(fld, dict):
+                                        name = (fld.get('name') or '').strip().lower()
+                                    if name in ('mmu gate', 'mmu_gate', 'mmu-gate'):
+                                        return item.get('value')
+                            # 4) extra dict
+                            ex = spool.get('extra')
+                            if isinstance(ex, dict):
+                                for k in ('MMU Gate', 'mmu gate', 'mmu_gate', 'mmu-gate'):
+                                    if k in ex:
+                                        return ex.get(k)
+                            return None
+
+                        def _extract_printer(spool: dict):
+                            # Same idea: different shapes
+                            for k in ('printer', 'printer_name', 'mmu_printer'):
+                                if k in spool:
+                                    return spool.get(k)
+                            mmu = spool.get('mmu')
+                            if isinstance(mmu, dict):
+                                for k in ('printer', 'printer_name', 'name'):
+                                    if k in mmu:
+                                        return mmu.get(k)
+                            return None
+
+                        for spool in data:
+                            if not isinstance(spool, dict):
+                                continue
+                            g = _extract_mmu_gate(spool)
+                            try:
+                                g = int(g)
+                            except Exception:
+                                continue
+                            if g != int(gate):
+                                continue
+                            if printer_name:
+                                p = _extract_printer(spool)
+                                if (p or '').strip() != printer_name:
+                                    continue
+                            sid = spool.get('id')
+                            try:
+                                return int(sid)
+                            except Exception:
+                                continue
+                        return None
+
+                    import asyncio
+                    try:
+                        # run async pull without blocking
+                        async def _pull_then_set():
+                            nonlocal target_spool
+                            target_spool = await _find_spool_id_for_gate()
+                            if target_spool is None and getattr(self, 'spoolman_clear_on_empty', True):
+                                # explicitly clear if nothing matches
+                                target_spool = None
+                            await _post_active_spool(target_spool)
+
+                        asyncio.create_task(_pull_then_set())
+                        return
+                    except Exception:
+                        pass
+
+            # If still None: clear or do nothing based on config
+            if target_spool is None and not getattr(self, 'spoolman_clear_on_empty', True):
+                return
+
+            # --- Push/clear to Moonraker active spool ---
+            async def _post_active_spool(spool_id):
+                try:
+                    url_base = getattr(self, '_spoolman_moonraker_url', 'http://127.0.0.1:7125').rstrip('/')
+                    url = f"{url_base}/server/spoolman/spool_id"
+                    timeout = aiohttp.ClientTimeout(total=2)
+                    async with aiohttp.ClientSession(timeout=timeout) as session:
+                        async with session.post(url, json={'spool_id': spool_id}) as resp:
+                            await resp.text()
+                except Exception:
+                    pass
+
+            # Debounce: only send when gate/spool actually changes
+            last_gate = getattr(self, '_spoolman_last_gate', None)
+            last_sid = getattr(self, '_spoolman_last_spool_id', object())
+            if gate == last_gate and target_spool == last_sid:
+                return
+            self._spoolman_last_gate = gate
+            self._spoolman_last_spool_id = target_spool
+
+            import asyncio
+            asyncio.create_task(_post_active_spool(target_spool))
+
+        except Exception:
+            pass
+
 
     def patch_status(self, status: dict):
 
@@ -2088,6 +2264,10 @@ class MmuAcePatcher:
 
         for key, value in mmu_status.items():
             status[key] = value
+
+        # --- Spoolman sync (optional) ---
+        self._spoolman_sync_from_gate(mmu_status)
+
         # status = self._combine(mmu_status, status)
 
         return status
