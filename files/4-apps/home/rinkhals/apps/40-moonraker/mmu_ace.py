@@ -603,11 +603,22 @@ class MmuAceController:
         """
         # Only active in push mode
         if self.spoolman_support != "push":
+            logging.debug(
+                f"[Spoolman] push skipped (mode={self.spoolman_support}, spool_id={spool_id})"
+            )
+            return
+
+        # Validate spool_id
+        if spool_id is not None and spool_id <= 0:
+            logging.debug(
+                f"[Spoolman] push skipped (invalid spool_id={spool_id})"
+            )
             return
 
         # Rate limit: max 1 update per second
         now = time.time()
         if now - self._last_spoolman_sync < 1.0:
+            logging.debug("[Spoolman] push skipped (rate limited)")
             return
         self._last_spoolman_sync = now
 
@@ -618,7 +629,7 @@ class MmuAceController:
                         "spoolman_set_active_spool",
                         {}
                     )
-                    logging.info("[Spoolman] cleared active spool")
+                    logging.info("[Spoolman] active spool cleared")
                 else:
                     await self.server.call_method(
                         "spoolman_set_active_spool",
@@ -629,6 +640,7 @@ class MmuAceController:
                 logging.warning(f"[Spoolman] push failed: {e}")
 
         await self._run_spoolman_task(task())
+
 
     def _handle_status_update(self, force: bool = False, throttle: bool = False):
         """Send status update notification with debouncing or throttling.
