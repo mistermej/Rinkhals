@@ -1,75 +1,69 @@
 name: Build SWU
-
 on:
   workflow_dispatch:
-
-permissions:
-  contents: read
-  packages: write
-
+    inputs:
+      use_cache:
+        description: 'Use Docker build cache'
+        required: true
+        type: boolean
+        default: true
 jobs:
-
   build:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 120
     steps:
     - uses: actions/checkout@v4
-
+      with:
+        fetch-depth: 0
     - name: Set up QEMU
       uses: docker/setup-qemu-action@v3
-
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
-
     - name: Login to GitHub Container Registry
       uses: docker/login-action@v3
       with:
         registry: ghcr.io
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
-
-    - name: Build and export
+    - name: Calculate daily build number
+      id: daily_build
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        TODAY=$(date +%Y%m%d)
+        
+        echo "Today's date: $TODAY"
+        
+        # Count releases created today with YYYYMMDD_NN format
+        COUNT=$(gh release list --limit 1000 | grep "^${TODAY}_" | wc -l)
+        
+        echo "Found $COUNT releases for today"
+        
+        # Next build number
+        NEXT_BUILD=$((COUNT + 1))
+        BUILD_NUM=$(printf '%02d' $NEXT_BUILD)
+        
+        echo "VERSION=${TODAY}_${BUILD_NUM}" >> $GITHUB_OUTPUT
+        echo "Building version: ${TODAY}_${BUILD_NUM}"
+    - name: Build Docker image for KS1
       uses: docker/build-push-action@v6
       with:
         push: false
         context: .
-        build-args: version=${{ github.sha }}
+        build-args: |
+          version=${{ steps.daily_build.outputs.VERSION }}
+          KOBRA_MODEL_CODE=ks1
         outputs: type=local,dest=./build/dist
-#        cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/rinkhals:buildcache
-#        cache-to: type=registry,ref=ghcr.io/${{ github.repository_owner }}/rinkhals:buildcache,mode=max
-
-    - name: Upload artifact for K2P, K3
-      uses: actions/upload-artifact@v4
+        cache-from: ${{ inputs.use_cache && 'type=gha' || '' }}
+        cache-to: ${{ inputs.use_cache && 'type=gha,mode=max' || '' }}
+    - name: Prepare SWU file
+      run: |
+        mkdir -p artifact
+        cp build/dist/update-ks1.swu artifact/update.swu
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
       with:
-        name: update-k2p-k3
-        compression-level: 0
-        path: |
-          build/dist/*-k2p-k3.swu
-          build/dist/*-k2p-k3.zip
-
-    - name: Upload artifact for KS1
-      uses: actions/upload-artifact@v4
-      with:
-        name: update-ks1
-        compression-level: 0
-        path: |
-          build/dist/*-ks1.swu
-          build/dist/*-ks1.zip
-
-    - name: Upload artifact for KS1M
-      uses: actions/upload-artifact@v4
-      with:
-        name: update-ks1m
-        compression-level: 0
-        path: |
-          build/dist/*-ks1m.swu
-          build/dist/*-ks1m.zip
-
-    - name: Upload artifact for K3M
-      uses: actions/upload-artifact@v4
-      with:
-        name: update-k3m
-        compression-level: 0
-        path: |
-          build/dist/*-k3m.swu
-          build/dist/*-k3m.zip
+        files: artifact/update.swu
+        tag_name: ${{ steps.daily_build.outputs.VERSION }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
